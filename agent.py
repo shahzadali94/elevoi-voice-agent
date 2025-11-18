@@ -20,35 +20,50 @@ logger = logging.getLogger(__name__)
 class AppointmentBookingAgent:
     """AI Agent for booking appointments via phone"""
 
-    def __init__(self):
+    def __init__(self, business_id: str):
+        self.business_id = business_id
         self.elevoi_api_url = os.getenv("ELEVOI_API_URL", "https://elevoi.vercel.app")
         self.elevoi_api_key = os.getenv("ELEVOI_API_KEY", "")
 
     async def check_availability(
         self,
         date: Annotated[str, "Date in YYYY-MM-DD format"],
-        time: Annotated[str, "Time in HH:MM format (24-hour)"]
+        duration_minutes: Annotated[int, "Duration in minutes (default 30)"] = 30
     ) -> str:
-        """Check if an appointment slot is available"""
+        """Check available appointment slots for a given date"""
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
-                    f"{self.elevoi_api_url}/api/appointments/availability",
-                    params={"date": date, "time": time},
+                    f"{self.elevoi_api_url}/api/voice-agent/availability",
+                    params={
+                        "businessId": self.business_id,
+                        "date": date,
+                        "duration": duration_minutes
+                    },
                     headers={"Authorization": f"Bearer {self.elevoi_api_key}"},
                     timeout=10.0
                 )
 
                 if response.status_code == 200:
                     data = response.json()
-                    if data.get("available"):
-                        return f"Yes, {date} at {time} is available. Would you like to book it?"
+                    if data.get("available") and data.get("slots"):
+                        slots = data["slots"][:5]  # Show first 5 slots
+                        slot_times = []
+                        for slot in slots:
+                            start_time = slot.get("startTime", "")
+                            # Extract time from ISO string (e.g., "14:00" from "2024-01-01T14:00:00")
+                            if "T" in start_time:
+                                time_part = start_time.split("T")[1].split(":")[0:2]
+                                time_str = ":".join(time_part)
+                                slot_times.append(time_str)
+
+                        if slot_times:
+                            times_str = ", ".join(slot_times[:3])
+                            return f"Yes, we have availability on {date}. Some available times are: {times_str}. What time works best for you?"
+                        else:
+                            return f"We have {len(slots)} available slots on {date}. What time would you prefer?"
                     else:
-                        alternatives = data.get("alternatives", [])
-                        if alternatives:
-                            alt_times = ", ".join([f"{a['time']}" for a in alternatives[:3]])
-                            return f"That time is not available. How about these times: {alt_times}?"
-                        return "That time is not available. Would you like to try a different time?"
+                        return f"I'm sorry, we don't have any availability on {date}. Would you like to try a different date?"
                 else:
                     return "I'm having trouble checking availability. Let me transfer you to our staff."
         except Exception as e:
@@ -60,31 +75,47 @@ class AppointmentBookingAgent:
         date: Annotated[str, "Date in YYYY-MM-DD format"],
         time: Annotated[str, "Time in HH:MM format (24-hour)"],
         service: Annotated[str, "Service name (e.g., 'Haircut', 'Massage')"],
-        customer_name: Annotated[str, "Customer's full name"] = "Unknown",
-        customer_phone: Annotated[str, "Customer's phone number"] = ""
+        customer_name: Annotated[str, "Customer's full name"],
+        customer_phone: Annotated[str, "Customer's phone number"],
+        duration_minutes: Annotated[int, "Duration in minutes (default 30)"] = 30
     ) -> str:
         """Book an appointment for the customer"""
         try:
+            from datetime import datetime, timedelta
+
+            # Parse date and time
+            start_datetime = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
+            end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+
+            # Format as ISO strings
+            start_time_iso = start_datetime.isoformat()
+            end_time_iso = end_datetime.isoformat()
+
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{self.elevoi_api_url}/api/appointments/book",
+                    f"{self.elevoi_api_url}/api/voice-agent/book",
                     json={
-                        "date": date,
-                        "time": time,
-                        "service": service,
+                        "businessId": self.business_id,
                         "customerName": customer_name,
-                        "customerPhone": customer_phone
+                        "customerPhone": customer_phone,
+                        "service": service,
+                        "startTime": start_time_iso,
+                        "endTime": end_time_iso,
+                        "notes": "Booked via AI voice agent"
                     },
                     headers={"Authorization": f"Bearer {self.elevoi_api_key}"},
                     timeout=10.0
                 )
 
-                if response.status_code == 200:
+                if response.status_code == 201:
                     data = response.json()
-                    return f"Great! Your {service} appointment is confirmed for {date} at {time}. You'll receive a confirmation shortly."
+                    return f"Perfect! Your {service} appointment is confirmed for {date} at {time}. You'll receive a confirmation text message shortly. Is there anything else I can help you with?"
                 else:
                     error_data = response.json()
-                    return f"I couldn't book that appointment. {error_data.get('error', 'Please try again.')}"
+                    error_msg = error_data.get("error", "Please try again.")
+                    if "already booked" in error_msg.lower():
+                        return f"I apologize, but that time slot was just booked by someone else. Let me check other available times for you."
+                    return f"I couldn't book that appointment. {error_msg}"
         except Exception as e:
             logger.error(f"Error booking appointment: {e}")
             return "I'm having trouble booking the appointment right now. Let me transfer you to our staff."
@@ -93,9 +124,6 @@ class AppointmentBookingAgent:
 async def entrypoint(ctx: JobContext):
     """Main entry point for the voice agent"""
     logger.info(f"Starting voice agent for room: {ctx.room.name}")
-
-    # Initialize booking helper
-    booking_agent = AppointmentBookingAgent()
 
     # Get business context from room metadata
     room_metadata = ctx.room.metadata or "{}"
@@ -108,7 +136,14 @@ async def entrypoint(ctx: JobContext):
         business_name = "our business"
         business_id = None
 
+    if not business_id:
+        logger.error("⚠️ No business_id in room metadata! Cannot initialize booking agent.")
+        return
+
     logger.info(f"Agent serving business: {business_name} (ID: {business_id})")
+
+    # Initialize booking helper with business_id
+    booking_agent = AppointmentBookingAgent(business_id)
 
     # Create system prompt
     initial_ctx = agents.llm.ChatContext().append(
